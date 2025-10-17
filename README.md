@@ -3,9 +3,9 @@ PS C:\Users\Lap1578\Documents\iNextLabs\R&D\whatsapp> python .\app_v4.py
 ======================================================================
 🚀 WhatsApp Voice Agent Server (aiortc + Whisper)
 ======================================================================
-📞 Phone Number: +15551441906
-📱 Phone ID: 518638374672395
-🏢 WABA ID: 553133154547046
+📞 Phone Number: +
+📱 Phone ID: 
+🏢 WABA ID: 
 🎵 Audio File: ./sound.mp3 (exists=True)
 ======================================================================
 ✅ Ready to receive calls!
