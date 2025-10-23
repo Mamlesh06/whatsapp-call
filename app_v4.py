@@ -17,10 +17,10 @@ active_calls = {}
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-WABA_ID = "553133154547046"
-PHONE_ID = "518638374672395"
-PHONE_NUMBER = "15551441906"
-ACCESS_TOKEN = "EAAhEqQy6qI0BO7QZC8qNAu1zUmyDu7aRZCceSngf7i9q6HAfXoDdN3yhqSjhWGRtMhtT4W7nKRwFURsbgzdaBwiu5ukeepfSh9MfZCP8APfhWZBNzVVYg9ZBJhGkElCC8DB6Q8l0d6ZCSjAuhqadkuwwMc38Q8xspa1ZCvZCk0vAvQGQh1RXDUVtVZBnMCaCGCodKDgZDZD"
+WABA_ID = "WABAID"
+PHONE_ID = "PHONEID"
+PHONE_NUMBER = "NUMBER"
+ACCESS_TOKEN = "TOKEN"
 GRAPH_API_BASE = "https://graph.facebook.com/v14.0"
 CALLS_ENDPOINT = f"{GRAPH_API_BASE}/{PHONE_ID}/calls"
 AUDIO_FILE = "./sound.mp3"
