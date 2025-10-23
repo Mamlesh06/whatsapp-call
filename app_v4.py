@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import asyncio, json, os, logging, re, secrets
+import asyncio, json, os, logging, re
 from threading import Thread
 import requests
 import numpy as np
@@ -9,53 +9,57 @@ from fractions import Fraction
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, MediaStreamTrack
 from av import AudioFrame
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("wa-voice")
+app = Flask(__name__)
+active_calls = {}
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-WABA_ID = "WABA"
-PHONE_ID = "PHONE_ID"
-PHONE_NUMBER = "NUMBER"
-ACCESS_TOKEN = "ACCESSTOKEN"  # <<<<<< put your token here
-
+WABA_ID = "553133154547046"
+PHONE_ID = "518638374672395"
+PHONE_NUMBER = "15551441906"
+ACCESS_TOKEN = "EAAhEqQy6qI0BO7QZC8qNAu1zUmyDu7aRZCceSngf7i9q6HAfXoDdN3yhqSjhWGRtMhtT4W7nKRwFURsbgzdaBwiu5ukeepfSh9MfZCP8APfhWZBNzVVYg9ZBJhGkElCC8DB6Q8l0d6ZCSjAuhqadkuwwMc38Q8xspa1ZCvZCk0vAvQGQh1RXDUVtVZBnMCaCGCodKDgZDZD"
 GRAPH_API_BASE = "https://graph.facebook.com/v14.0"
 CALLS_ENDPOINT = f"{GRAPH_API_BASE}/{PHONE_ID}/calls"
-
-AUDIO_FILE = "./sound.mp3"   # file we will stream to the user (looped)
+AUDIO_FILE = "./sound.mp3"
 STUN_SERVERS = ["stun:stun.l.google.com:19302"]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LOGGING
-# ──────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("wa-voice")
-
-app = Flask(__name__)
-active_calls = {}  # call_id -> dict(pc, track, stt, ...)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# AUDIO OUT: simple looped PCM16 @ 48kHz, 20ms frames
+# DEBUG AUDIO TRACK WITH LOGGING
 # ──────────────────────────────────────────────────────────────────────────────
 class LoopingAudioTrack(MediaStreamTrack):
     kind = "audio"
-
     def __init__(self, path: str, sample_rate: int = 48000):
         super().__init__()
         self.sample_rate = sample_rate
-        self.samples_per_frame = 960  # 20 ms @ 48k
+        self.samples_per_frame = 960
         self._enabled = False
         self._cursor = 0
-        # load mono file, resample to 48k, int16
+        self._frame_count = 0
+        self._bytes_sent = 0
+        
         y, _ = librosa.load(path, sr=self.sample_rate, mono=True)
         y = np.clip(y, -1.0, 1.0)
         self._audio = (y * 32767.0).astype(np.int16)
         dur = len(self._audio) / self.sample_rate
         print(f"✅ Loaded audio: {len(self._audio)} samples, {dur:.2f} seconds")
-
+    
     def start(self):
         self._enabled = True
-
+        print("[TRACK] ✅ Track.start() called - media transmission ENABLED")
+    
     async def recv(self):
+        self._frame_count += 1
+        self._bytes_sent += self.samples_per_frame * 2  # 2 bytes per sample
+        
+        # Log every 25 frames (~0.5 sec at 50 FPS)
+        if self._frame_count % 25 == 1:
+            print(f"[TRACK] Frame #{self._frame_count}, enabled={self._enabled}, bytes_sent={self._bytes_sent}, cursor={self._cursor}")
+        
         await asyncio.sleep(0.02)
+        
         if not self._enabled:
             chunk = np.zeros(self.samples_per_frame, dtype=np.int16)
             pts = 0
@@ -72,6 +76,7 @@ class LoopingAudioTrack(MediaStreamTrack):
                 chunk = np.concatenate([first, second])
                 self._cursor = remain
             pts = start
+        
         frame = AudioFrame.from_ndarray(chunk.reshape(1, -1), format="s16", layout="mono")
         frame.sample_rate = self.sample_rate
         frame.time_base = Fraction(1, self.sample_rate)
@@ -79,78 +84,64 @@ class LoopingAudioTrack(MediaStreamTrack):
         return frame
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STT: Whisper translate-to-English (rolling)
-# ──────────────────────────────────────────────────────────────────────────────
-def resample_48k_to_16k_mono(pcm16_48k_mono: np.ndarray) -> np.ndarray:
-    if pcm16_48k_mono.size == 0:
-        return pcm16_48k_mono
-    x = pcm16_48k_mono.astype(np.float32) / 32768.0
-    y = librosa.resample(x, orig_sr=48000, target_sr=16000, res_type="kaiser_fast")
-    y = np.clip(y, -1.0, 1.0)
-    return (y * 32767.0).astype(np.int16)
-
-class WhisperTranslateWorker:
-    """
-    Collects 16kHz mono PCM16 and periodically runs Whisper with task='translate'.
-    """
-    def __init__(self, model_name="base", target_sr=16000, window_sec=7.0, hop_sec=2.0):
-        self.model = whisper.load_model(model_name)
-        self.target_sr = target_sr
-        self.window_sec = window_sec
-        self.hop_sec = hop_sec
-        self.buffer = np.empty(0, dtype=np.int16)
-        self._running = True
-
-    def add_pcm16(self, pcm16_16k: np.ndarray):
-        if pcm16_16k.size:
-            if pcm16_16k.dtype != np.int16:
-                pcm16_16k = pcm16_16k.astype(np.int16)
-            self.buffer = np.concatenate([self.buffer, pcm16_16k])
-
-    def stop(self):
-        self._running = False
-
-    async def loop(self, call_id: str):
-        while self._running:
-            await asyncio.sleep(self.hop_sec)
-            if self.buffer.size < int(1.0 * self.target_sr):
-                continue
-            buf = self.buffer[-int(self.window_sec * self.target_sr):]
-            audio_f32 = buf.astype(np.float32) / 32768.0
-            try:
-                result = self.model.transcribe(audio_f32, task="translate", language=None, fp16=False)
-                text = (result.get("text") or "").strip()
-                if text:
-                    print(f"[STT:{call_id}] {text}")
-            except Exception as e:
-                print(f"[STT:{call_id}] whisper error: {e}")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SDP helpers: ONLY the safe tweaks
+# SIMPLIFIED SDP - NO OPUS PARAM MODIFICATION FOR NOW
 # ──────────────────────────────────────────────────────────────────────────────
 def sanitize_sdp_for_whatsapp(sdp: str) -> str:
-    """
-    WhatsApp is picky:
-      - fingerprint algo MUST be uppercased: a=fingerprint:SHA-256
-      - remove any sha-384/sha-512 lines
-      - CRLF line endings
-    Do NOT touch the actual fingerprint value or other DTLS/ICE lines.
-    """
-    s = sdp
-    s = s.replace("\r\n", "\n").replace("\n", "\r\n")
-    s = re.sub(r"^a=fingerprint:sha-256", "a=fingerprint:SHA-256", s, flags=re.MULTILINE)
-    s = re.sub(r"^a=fingerprint:sha-384.*\r?\n", "", s, flags=re.MULTILINE)
-    s = re.sub(r"^a=fingerprint:sha-512.*\r?\n", "", s, flags=re.MULTILINE)
-    if not s.endswith("\r\n"):
-        s += "\r\n"
-    return s
+    """Add missing Meta-required attributes and sanitize"""
+    lines = sdp.split("\r\n")
+    new_lines = []
+    
+    # Normalize line endings first
+    sdp = sdp.replace("\r\n", "\n").replace("\n", "\r\n")
+    lines = sdp.split("\r\n")
+    new_lines = []
+    
+    in_audio_section = False
+    added_ice_lite = False
+    added_rtcp_fb = False
+    added_fmtp = False
+    
+    for i, line in enumerate(lines):
+        # Add a=ice-lite right after session attributes, before m=audio
+        if line.startswith("m=audio") and not added_ice_lite:
+            new_lines.append("a=ice-lite")
+            added_ice_lite = True
+            in_audio_section = True
+        
+        # Add codec parameters after rtpmap line
+        if in_audio_section and "a=rtpmap:111 opus/48000/2" in line:
+            new_lines.append(line)
+            # Add rtcp-fb if not already there
+            if not added_rtcp_fb:
+                new_lines.append("a=rtcp-fb:111 transport-cc")
+                added_rtcp_fb = True
+            # Add fmtp if not already there
+            if not added_fmtp:
+                new_lines.append("a=fmtp:111 minptime=10;useinbandfec=1")
+                added_fmtp = True
+            continue
+        
+        # Fix fingerprint to uppercase SHA-256
+        if "a=fingerprint:sha-256" in line.lower():
+            line = re.sub(r"a=fingerprint:sha-256", "a=fingerprint:SHA-256", line, flags=re.IGNORECASE)
+        
+        # Remove sha-384 and sha-512 fingerprints
+        if "a=fingerprint:sha-384" in line.lower() or "a=fingerprint:sha-512" in line.lower():
+            continue
+        
+        new_lines.append(line)
+    
+    result = "\r\n".join(new_lines)
+    if not result.endswith("\r\n"):
+        result += "\r\n"
+    
+    return result
 
 async def wait_for_ice_gathering_complete(pc: RTCPeerConnection, timeout=3.5):
     if pc.iceGatheringState == "complete":
         return
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
-
     @pc.on("icegatheringstatechange")
     def _on_gather():
         if pc.iceGatheringState == "complete" and not fut.done():
@@ -160,8 +151,24 @@ async def wait_for_ice_gathering_complete(pc: RTCPeerConnection, timeout=3.5):
     except asyncio.TimeoutError:
         pass
 
+async def wait_for_dtls_connected(pc: RTCPeerConnection, timeout=10.0):
+    print("⏳ Waiting for DTLS handshake...")
+    start_time = asyncio.get_event_loop().time()
+    while True:
+        if pc.connectionState == "connected":
+            print("✅ DTLS complete")
+            return True
+        if pc.connectionState == "failed":
+            print("❌ DTLS failed")
+            return False
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if elapsed > timeout:
+            print(f"⚠️ DTLS timeout ({timeout}s)")
+            return False
+        await asyncio.sleep(0.1)
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Graph API: pre-accept / accept
+# GRAPH API
 # ──────────────────────────────────────────────────────────────────────────────
 def _auth_headers():
     return {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
@@ -176,12 +183,12 @@ async def send_pre_accept(call_id: str, sdp_answer: str) -> bool:
     try:
         r = requests.post(CALLS_ENDPOINT, json=payload, headers=_auth_headers(), timeout=10)
         if r.status_code == 200:
-            print("✅ Call pre-accepted by WhatsApp")
+            print("✅ pre-accept sent")
             return True
-        print(f"❌ pre_accept {r.status_code} {r.text}")
+        print(f"❌ pre-accept failed: {r.status_code}")
         return False
     except Exception as e:
-        print(f"❌ pre_accept exception: {e}")
+        print(f"❌ pre-accept error: {e}")
         return False
 
 async def send_accept(call_id: str, sdp_answer: str) -> bool:
@@ -194,132 +201,158 @@ async def send_accept(call_id: str, sdp_answer: str) -> bool:
     try:
         r = requests.post(CALLS_ENDPOINT, json=payload, headers=_auth_headers(), timeout=10)
         if r.status_code == 200:
-            print("✅ Call accepted by WhatsApp")
+            print("✅ accept sent")
             return True
-        print(f"❌ accept {r.status_code} {r.text}")
+        print(f"❌ accept failed: {r.status_code}")
         return False
     except Exception as e:
-        print(f"❌ accept exception: {e}")
+        print(f"❌ accept error: {e}")
         return False
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Diagnostics
+# DIAGNOSTICS WITH DETAILED LOGGING
 # ──────────────────────────────────────────────────────────────────────────────
-async def log_diagnostics(pc: RTCPeerConnection, call_id: str):
-    last = 0
+async def log_diagnostics(pc: RTCPeerConnection, call_id: str, out_track):
+    print("[DIAG] Starting diagnostics loop...")
+    last_bytes = 0
+    check_count = 0
+    
     while pc.connectionState not in ("failed", "closed"):
-        stats = await pc.getStats()
-        outs = [s for s in stats.values()
-                if getattr(s, "type", "") == "outbound-rtp"
-                and getattr(s, "kind", "") == "audio"]
-        if outs:
-            s = outs[0]
-            print(f"[diag:{call_id}] bytesSent={s.bytesSent} packetsSent={s.packetsSent}")
-            if s.bytesSent == last:
-                print(f"[diag:{call_id}] WARNING: no growth — check firewall / DTLS / track")
-            last = s.bytesSent
-
-        pairs = [s for s in stats.values()
-                 if getattr(s, "type", "") == "candidate-pair"
-                 and getattr(s, "state", "") == "succeeded"
-                 and getattr(s, "nominated", False)]
-        if pairs:
-            cp = pairs[0]
-            lc = stats.get(getattr(cp, "localCandidateId", ""))
-            rc = stats.get(getattr(cp, "remoteCandidateId", ""))
-            if lc and rc:
-                print(f"[diag:{call_id}] selected {lc.address}:{lc.port} -> {rc.address}:{rc.port} ({lc.protocol})")
+        check_count += 1
+        try:
+            stats = await pc.getStats()
+            
+            # Check outbound RTP
+            outs = [s for s in stats.values()
+                    if getattr(s, "type", "") == "outbound-rtp"
+                    and getattr(s, "kind", "") == "audio"]
+            
+            if outs:
+                s = outs[0]
+                bytes_sent = getattr(s, "bytesSent", 0)
+                packets_sent = getattr(s, "packetsSent", 0)
+                print(f"[DIAG #{check_count}] bytesSent={bytes_sent} packetsSent={packets_sent} track.bytes={out_track._bytes_sent}")
+                
+                if bytes_sent == last_bytes:
+                    print(f"[DIAG #{check_count}] ⚠️ WARNING: No RTP packets sent!")
+                last_bytes = bytes_sent
+            else:
+                print(f"[DIAG #{check_count}] ❌ No outbound-rtp stats found!")
+            
+            # Check ICE
+            pairs = [s for s in stats.values()
+                     if getattr(s, "type", "") == "candidate-pair"
+                     and getattr(s, "state", "") == "succeeded"
+                     and getattr(s, "nominated", False)]
+            if pairs:
+                cp = pairs[0]
+                print(f"[DIAG #{check_count}] ICE pair active: {getattr(cp, 'localCandidateId', 'N/A')} -> {getattr(cp, 'remoteCandidateId', 'N/A')}")
+        
+        except Exception as e:
+            print(f"[DIAG #{check_count}] Error getting stats: {e}")
+        
         await asyncio.sleep(1.0)
+    
+    print(f"[DIAG] Diagnostics ended. Connection state: {pc.connectionState}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Call handling
+# CALL HANDLING
 # ──────────────────────────────────────────────────────────────────────────────
 async def handle_incoming_call(call_id: str, sdp_offer: str, caller_number: str, caller_name: str):
-    print("🚀 Setting up WebRTC connection...")
-
+    print("🚀 handle_incoming_call started")
+    
     if not os.path.exists(AUDIO_FILE):
         print(f"❌ Audio file not found: {AUDIO_FILE}")
         return
-
+    
     pc = RTCPeerConnection(RTCConfiguration(iceServers=[RTCIceServer(urls=STUN_SERVERS)]))
-
+    
     @pc.on("connectionstatechange")
     async def _on_conn():
-        print(f"🔗 Peer state: {pc.connectionState}")
-
+        print(f"[PC] Connection state changed: {pc.connectionState}")
+    
     @pc.on("iceconnectionstatechange")
     async def _on_ice():
-        print(f"🧊 ICE state: {pc.iceConnectionState}")
-
-    # OUTBOUND: attach our looped audio BEFORE setting the remote description
+        print(f"[PC] ICE state changed: {pc.iceConnectionState}")
+    
+    # Attach outbound audio
     out_track = LoopingAudioTrack(AUDIO_FILE)
-    pc.addTrack(out_track)  # keep it simple; binds the m=audio correctly
-
-    # INBOUND: receive caller audio and feed Whisper
-    stt_worker = WhisperTranslateWorker(model_name="base")
-
+    pc.addTrack(out_track)
+    print("[PC] ✅ Outbound audio track attached")
+    
+    # Attach inbound audio handler
     @pc.on("track")
     async def _on_track(in_track):
-        print(f"🎤 Receiving {in_track.kind} track from caller")
+        print(f"[PC] 📥 Inbound track received: {in_track.kind}")
         if in_track.kind != "audio":
             return
-
         async def reader():
+            frame_count = 0
             while True:
                 try:
                     frame = await in_track.recv()
-                except Exception:
+                    frame_count += 1
+                    if frame_count % 50 == 1:
+                        print(f"[INBOUND] Received frame #{frame_count}")
+                except Exception as e:
+                    print(f"[INBOUND] Reader stopped: {e}")
                     break
-                pcm = frame.to_ndarray(format="s16")  # (C, S) or (S,)
-                if pcm.ndim == 2 and pcm.shape[0] > 1:
-                    pcm = pcm.mean(axis=0).astype(np.int16)
-                elif pcm.ndim == 2:
-                    pcm = pcm[0]
-                else:
-                    pcm = pcm.astype(np.int16)
-                pcm16k = resample_48k_to_16k_mono(pcm)
-                stt_worker.add_pcm16(pcm16k)
-
         asyncio.create_task(reader())
-        asyncio.create_task(stt_worker.loop(call_id))
-
-    # SDP: set offer, create/set answer, sanitize, send to WhatsApp
+    
+    # SDP negotiation
     try:
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp_offer, type="offer"))
-        print("✅ Remote description set")
-
+        print("[SDP] ✅ Remote description set")
+        
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
-        print("✅ Local description set")
-
+        print("[SDP] ✅ Local description set")
+        
         await wait_for_ice_gathering_complete(pc, timeout=3.5)
-        print("✅ ICE gathering complete")
-
+        print("[SDP] ✅ ICE gathering complete")
+        
         sdp_answer = sanitize_sdp_for_whatsapp(pc.localDescription.sdp)
-        print("✅ SDP answer sanitized",sdp_answer)
-        # If you can't perfectly control media start timing, you can skip pre_accept and just accept.
+        print("[SDP] ✅ Answer sanitized")
+        print(f"[SDP] Answer summary: {len(sdp_answer)} chars, candidates: {sdp_answer.count('a=candidate')}")
+        
+        # Print the final SDP being sent to WhatsApp
+        print("\n" + "="*80)
+        print("📤 FINAL SDP ANSWER BEING SENT TO WHATSAPP:")
+        print("="*80)
+        print(sdp_answer)
+        print("="*80 + "\n")
+        
+        # Send accept
         if not await send_pre_accept(call_id, sdp_answer):
-            await pc.close(); return
+            await pc.close()
+            return
+        
         if not await send_accept(call_id, sdp_answer):
-            await pc.close(); return
-
-        # Start sending media only after accept
+            await pc.close()
+            return
+        
+        print("[CALL] Waiting for DTLS...")
+        if not await wait_for_dtls_connected(pc, timeout=10.0):
+            print("[CALL] ⚠️ DTLS handshake timeout")
+        
+        print("[CALL] Starting media transmission...")
         out_track.start()
-        print("🔊 Streaming started")
-
-        asyncio.create_task(log_diagnostics(pc, call_id))
-
+        print("[CALL] ✅ Media transmission started")
+        
+        # Start diagnostics
+        asyncio.create_task(log_diagnostics(pc, call_id, out_track))
+        
         active_calls[call_id] = {
             "pc": pc,
             "track": out_track,
-            "stt": stt_worker,
             "caller_number": caller_number,
             "caller_name": caller_name,
         }
-
+        
     except Exception as e:
-        print(f"❌ Error in handle_incoming_call: {e}")
-        import traceback; traceback.print_exc()
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
         await pc.close()
 
 async def cleanup_call(call_id: str):
@@ -327,18 +360,15 @@ async def cleanup_call(call_id: str):
     if not data:
         return
     try:
-        stt = data.get("stt")
-        if stt:
-            stt.stop()
         pc = data.get("pc")
         if pc:
             await pc.close()
     except Exception as e:
         print(f"Error closing PC: {e}")
-    print(f"✅ Call {call_id} cleaned up")
+    print(f"✅ Call cleaned up")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Webhook
+# WEBHOOK
 # ──────────────────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -349,12 +379,8 @@ def webhook():
             print("✅ Webhook verified!")
             return challenge, 200
         return "Invalid verification token", 403
-
-    # POST
+    
     data = request.json
-    print("\n📩 Webhook received:")
-    print(json.dumps(data, indent=2))
-
     if data.get("object") == "whatsapp_business_account":
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
@@ -370,61 +396,31 @@ async def handle_call_event(value):
     for call in calls:
         event = call.get("event")
         call_id = call.get("id")
-
         if event == "connect":
             caller_number = call.get("from")
-            business_number = call.get("to")
             sdp_offer = (call.get("session") or {}).get("sdp", "")
-
             contacts = value.get("contacts", [])
             caller_name = contacts[0].get("profile", {}).get("name", "Unknown") if contacts else "Unknown"
-
-            print("\n" + "="*60)
-            print("🔔 INCOMING CALL!")
-            print(f"   From: {caller_name} ({caller_number})")
-            print(f"   To: {business_number}")
-            print(f"   Call ID: {call_id}")
-            print("="*60)
-
+            print(f"\n🔔 INCOMING CALL from {caller_name}")
             await handle_incoming_call(call_id, sdp_offer, caller_number, caller_name)
-
         elif event == "terminate":
             status = call.get("status")
             duration = call.get("duration", 0)
-            print(f"\n📞 Call ended: {call_id}")
-            print(f"   Status: {status}, Duration: {duration}s")
+            print(f"\n📞 Call ended: {status}, duration: {duration}s")
             await cleanup_call(call_id)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Utility
-# ──────────────────────────────────────────────────────────────────────────────
 @app.route("/test", methods=["GET"])
 def test():
-    return jsonify({
-        "status": "ok",
-        "phone_number": PHONE_NUMBER,
-        "phone_id": PHONE_ID,
-        "active_calls": list(active_calls.keys()),
-        "audio_file": AUDIO_FILE,
-        "audio_exists": os.path.exists(AUDIO_FILE),
-    })
+    return jsonify({"status": "ok", "phone_number": PHONE_NUMBER, "active_calls": list(active_calls.keys())})
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("🚀 WhatsApp Voice Agent Server (aiortc + Whisper)")
+    print("🚀 WhatsApp Voice Agent (DEBUG MODE)")
     print("="*70)
-    print(f"📞 Phone Number: +{PHONE_NUMBER}")
-    print(f"📱 Phone ID: {PHONE_ID}")
-    print(f"🏢 WABA ID: {WABA_ID}")
-    print(f"🎵 Audio File: {AUDIO_FILE} (exists={os.path.exists(AUDIO_FILE)})")
-    print("="*70)
-    print("✅ Ready to receive calls!")
+    print(f"📞 Phone: +{PHONE_NUMBER}")
+    print(f"📁 Audio: {AUDIO_FILE} (exists={os.path.exists(AUDIO_FILE)})")
     print("="*70 + "\n")
-
-    if not os.path.exists(AUDIO_FILE):
-        print("⚠️  WARNING: './sound.mp3' not found — no audio will be sent.\n")
-
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
