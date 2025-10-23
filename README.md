@@ -1,4 +1,4 @@
-# ✅ Webhook Verification and Call Log
+"# ✅ Webhook Verification and Call Log
 
 **Date:** 2025-10-23  
 **Time:** 15:33:16 – 15:34:06  
@@ -12,14 +12,13 @@
 ```log
 ✅ Webhook verified!
 2025-10-23 15:33:16,804 - INFO - 127.0.0.1 - - [23/Oct/2025 15:33:16]  
-"GET /webhook?hub.mode=subscribe&hub.challenge=683904941&hub.verify_token=iNextLabsCloud HTTP/1.1" 200 -
+"GET /webhook?hub.mode=subscribe&hub.challenge=683904941&hub.verify_token=iNextLabsCloud HTTP/1.1" 200 
 
-
-
-# 📬 Incoming Webhook Events
-
+📬 Incoming Webhook Events
 2025-10-23 15:33:39,502 - INFO - 127.0.0.1 - - [23/Oct/2025 15:33:39]  
 "POST /webhook HTTP/1.1" 200 -
+
+🔔 Incoming Call Event
 
 Caller: +91 73585 80180
 Handler: handle_incoming_call
